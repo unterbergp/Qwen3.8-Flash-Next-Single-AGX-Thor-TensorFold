@@ -1,0 +1,75 @@
+diff --git tensorfold/cuda/scheduler.py tensorfold/cuda/scheduler.py
+--- tensorfold/cuda/scheduler.py
++++ tensorfold/cuda/scheduler.py
+@@ -2,19 +2,42 @@
+ 
+ from __future__ import annotations
+ 
++import itertools
+ import queue
+ import threading
++import time
+ from typing import Any, Callable
+ 
+ from .streams import Stream
+ 
+ 
++def _mem_available_gib() -> float:
++    """The host's MemAvailable (the GPU's memory too, on a unified-memory board such as Thor), or -1."""
++
++    try:
++        with open("/proc/meminfo") as f:
++            for line in f:
++                if line.startswith("MemAvailable:"):
++                    return int(line.split()[1]) / 2**20
++    except (OSError, ValueError):
++        pass
++    return -1.0
++
++
++def _log(rid: int | str, text: str) -> None:
++    """One line a request event, flushed at once: after a GPU hang the last lines say what was running."""
++
++    print(f"[tensorfold] {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} req {rid} {text}", flush=True)
++
++
+ class Scheduler:
+     def __init__(self, decoder: Any, *, max_streams: int = 4) -> None:
+         self.decoder = decoder
+         self.max_streams = max_streams
+         self.waiting: queue.Queue = queue.Queue()
+         self.boxes: dict[int, queue.Queue] = {}
++        self.rids: dict[int, int] = {}                # request numbers for the log, by id(stream)
++        self.numbers = itertools.count(1)
+         self.thread = threading.Thread(target=self._loop, daemon=True)
+         self.thread.start()
+ 
+@@ -48,9 +71,15 @@
+                 except queue.Empty:
+                     break
+             self.boxes[id(stream)] = box
++            rid = self.rids[id(stream)] = next(self.numbers)
++            _log(rid, f"start: prompt {len(stream.prompt)} tokens, max {stream.count}, "
++                      f"vision {'yes' if stream.vision is not None else 'no'}, "
++                      f"streams {self.decoder.live() + 1}/{self.max_streams}, waiting {self.waiting.qsize()}, "
++                      f"MemAvailable {_mem_available_gib():.1f} GiB")
+             try:
+                 self.decoder.admit(stream)
+             except Exception as exc:                 # noqa: BLE001  (this request fails, the others go on)
++                _log(self.rids.pop(id(stream)), f"failed at admit: {type(exc).__name__}: {exc}")
+                 self.boxes.pop(id(stream)).put(("error", exc))
+                 continue
+             if stream.done:
+@@ -60,6 +89,12 @@
+     def _reply(self, s: Stream, kind: str, value: Any) -> None:
+         box = self.boxes.pop(id(s), None)            # None: the stream's request has had its reply
+         if box is not None:
++            rid = self.rids.pop(id(s), "?")
++            if kind == "error":
++                _log(rid, f"failed: {type(value).__name__}: {value}")
++            else:
++                _log(rid, f"done: {len(s.out)} tokens, prefill {s.prefill_s:.1f}s, decode "
++                          f"{max(s.finished - s.started, 0.0):.1f}s, MemAvailable {_mem_available_gib():.1f} GiB")
+             box.put((kind, value))
+ 
+     def _loop(self) -> None:

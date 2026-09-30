@@ -1,49 +1,173 @@
 <h1 align="center">Qwen3.8 Flash Next on one Jetson AGX Thor (TensorFold)</h1>
 
-> **This fork runs on NVIDIA Jetson AGX Thor.** It is MiaAI Lab's DGX Spark TensorFold recipe with the few changes
-> Thor needs; the rest of this README is the upstream Spark text, and its numbers are Spark numbers unless marked Thor.
-> For the Spark version use [MiaAI Lab's repository](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold).
+> **This fork runs on NVIDIA Jetson AGX Thor.** It is MiaAI Lab's DGX Spark TensorFold recipe plus the few changes
+> Thor needs. This section documents the port; everything after the divider is the upstream Spark README, and its
+> numbers are Spark numbers. For the Spark version use
+> [MiaAI Lab's repository](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold).
 
-## AGX Thor
+- [Quick start on Thor](#quick-start-on-thor)
+- [What TensorFold is, compared with the vLLM Thor fork](#what-tensorfold-is-compared-with-the-vllm-thor-fork)
+- [Why it runs on Thor: what was checked](#why-it-runs-on-thor-what-was-checked)
+- [What changed for Thor](#what-changed-for-thor)
+- [Measured on Thor](#measured-on-thor)
+- [Reproducing the measurements](#reproducing-the-measurements)
+- [Thor notes and troubleshooting](#thor-notes-and-troubleshooting)
 
-Tested 2026-09-30 on AGX Thor (sm_110, 20 SMs, 122 GiB shared RAM), Jetson Linux R38.2.2, driver 580.00 / CUDA 13.0,
-MAXN power mode, GPU at 1,575 MHz. Same image as the Spark (`ghcr.io/miaai-lab/...:v0.3.6.3-c1f5d72f8d16`), same
-defaults: 5 streams x 262,144 tokens, int8 KV, n-gram tables on SSD, vision on. `./start.sh` works unchanged.
+## Quick start on Thor
 
-**Why it works:** TensorFold JIT-compiles its CUDA extensions for the GPU present (`-gencode ... sm_110`), and its
-kernels use only sm_90-level features (FP8 `mma.sync`, thread-block clusters, `cp.async`) plus Triton, all of which
-Thor supports. Memory is detected as unified (`is_integrated`), so the budget comes from `MemAvailable`: 105.6 GiB on
-an idle Thor against the default's 102.5 GiB estimate. The container's CUDA 13.3 runs on the 13.0 driver in minor
-version compatibility mode (the warning at start is expected); the kernels are native sm_110 code, so no driver JIT
-is needed.
+```bash
+git clone https://github.com/unterbergp/Qwen3.8-Flash-Next-Single-AGX-Thor-TensorFold.git
+cd Qwen3.8-Flash-Next-Single-AGX-Thor-TensorFold
+sudo nvpmodel -m 0 && sudo jetson_clocks   # MAXN and fixed clocks, as measured below (optional)
+./start.sh                                   # first run: pulls the image (~11 GB), downloads ~106 GiB, then serves
+./stop.sh                                    # stop it and free the memory
+```
 
-**What changed for Thor:**
+The API is `http://<thor-address>:8888/v1`, model `Qwen3.8-Flash-Next`. Every setting, command and check in the
+Spark README below applies unchanged (`./start.sh restart`, `PARALLEL`, `CONTEXT`, `VISION=0`, `tools/*.py`, ...).
 
-- `docker run` uses `--runtime nvidia --gpus all` (`GPU_ARGS` in `scripts/config.sh`): JetPack 7 rejects bare
-  `--gpus all` ("use the NVIDIA Container Runtime").
-- The loading heartbeat reads the drop in `MemAvailable`: Thor's `nvidia-smi` reports no per-process memory.
-- Text: Thor instead of Spark/GB10 in the scripts' messages.
+Tested 2026-09-30 on AGX Thor (sm_110, 20 SMs, 122 GiB shared RAM, WD SN5000S NVMe), Jetson Linux R38.2.2, driver
+580.00 / CUDA 13.0, Docker with the nvidia runtime, MAXN power mode with the GPU at 1,575 MHz. Image:
+`ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold:v0.3.6.3-c1f5d72f8d16` (the Spark image,
+unchanged). Defaults: 5 streams x 262,144 tokens, int8 KV, n-gram tables on SSD, image and video input on.
 
-**Measured on Thor** (one start, server idle between runs):
+## What TensorFold is, compared with the vLLM Thor fork
+
+The earlier Thor port ([unterbergp/Qwen3.8-Flash-Next-AGX-Thor](https://github.com/unterbergp/Qwen3.8-Flash-Next-AGX-Thor), `start-thor.sh`)
+serves the NVFP4 checkpoint with vLLM. It needed Thor workarounds: Marlin MoE instead of CUTLASS, persistent top-k
+instead of the cooperative kernel, V2 runner fixes for CUDA graphs and MTP, and one sequence at a time.
+
+TensorFold is a different engine, not a vLLM option. None of those workarounds apply to it.
+
+| | vLLM Thor fork | This fork (TensorFold v0.3.6.3) |
+| --- | --- | --- |
+| Engine | vLLM (`vllm/vllm-openai:qwen38-flash-next`) | TensorFold on `nvcr.io/nvidia/pytorch:26.07-py3` |
+| Checkpoint | NVFP4 | `Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP` (MLX 4-bit, group 32, MTP head) |
+| Kernels | vLLM's prebuilt kernels (CUTLASS / Marlin, FlashInfer) | its own CUDA extensions and Triton kernels, compiled at first start for the GPU present |
+| Drafting | MTP, 3 tokens | MTP, up to 6 tokens with a 60% confidence cut-off, plus prompt-lookup drafts |
+| n-gram (PLE) tables | memory-mapped | read from NVMe per lookup (`--ple-on-ssd`), leaving 29.8 GiB to the KV cache |
+| Streams x context | 1 x 262k, BF16 KV | 5 x 262k, int8 KV (1.31 M-token pool) |
+| Images / video | — | yes (patch 0008) |
+
+MiaAI's patches (`patches/`, described in [What the patches change](#what-the-patches-change)) add read-ahead and a
+native C++ reader for the SSD tables, a register-spill fix in the sparse-attention block select, configurable
+prompt chunks, prompt-copy drafts, vision, and stats. They change speed, not output. None of them is specific to GB10.
+
+## Why it runs on Thor: what was checked
+
+The review looked for anything that ties TensorFold to GB10 (sm_121), then tested each risk on the Thor:
+
+1. **Kernel architecture.** `tensorfold/cuda/build.py` builds every extension with
+   `-gencode=arch=compute_XY,code=sm_XY` taken from `torch.cuda.get_device_capability()`. The minimum is sm_90.
+   Thor is sm_110, so it gets native code; nothing is hard-coded to sm_121.
+2. **Instructions used.** The inline PTX is sm_89/sm_90-level: FP8 `mma.sync.m16n8k32.e4m3`, bf16 `mma.sync`,
+   thread-block clusters (at most 8, the portable size), `cp.async`. It uses no `tcgen05`, block-scaled FP4 `mma`
+   or other sm_12x-only instructions. The rest of Flash Next is Triton.
+3. **The container on Thor's driver.** The image's CUDA 13.3 runs on driver 580.00 (CUDA 13.0) in *minor version
+   compatibility* mode. torch 2.13 (nv26.07) sees `NVIDIA Thor, (11, 0), 20 SMs, is_integrated=1`, and bf16 matmul
+   works. Because the kernels are native sm_110 code, no driver JIT is needed.
+4. **Building the extensions.** All six extensions Flash Next uses were compiled and loaded inside the image on
+   Thor: `tensorfold_qmm_v3` (31 s), `tensorfold_gdn_v2` (26 s), `tensorfold_experts_v6` (52 s),
+   `tensorfold_qwen4_exp_gdn` (20 s), `tensorfold_qwen4_exp_gdn_io` (20 s) and the patched SSD reader (17 s).
+   A Triton kernel also compiled and ran. They are cached in `~/.cache/tensorfold-qwen38`.
+5. **Memory model.** `capacity.unified()` uses `is_integrated`, which is true on Thor. The budget is therefore
+   `MemAvailable - RAM/10`: 105.6-105.8 GiB on an idle Thor, against 102.5 GiB for the default setting.
+   That is a little more room than a Spark's ~103-104 GiB.
+6. **Tuning constants.** The patches' Triton tile sizes (`SELECT_TILE`, `num_warps`) are per-SM choices. The
+   native SSD reader's 64 threads are sized to the NVMe queue, not the CPU. Both carry over to Thor's 14 CPU cores
+   and 20 SMs unchanged.
+
+## What changed for Thor
+
+Only the scripts changed; the image and patches are the Spark's.
+
+| File | Change | Why |
+| --- | --- | --- |
+| `scripts/config.sh` | new `GPU_ARGS` (default `--runtime nvidia --gpus all`), used by `start.sh` | JetPack 7 rejects bare `--gpus all`: *"invoking the NVIDIA Container Runtime Hook directly (e.g. specifying the docker --gpus flag) is not supported. Please use the NVIDIA Container Runtime (e.g. specify the --runtime=nvidia flag)"*. A Spark accepts this too. |
+| `start.sh` | loading heartbeat = drop in `MemAvailable` since launch | Thor's `nvidia-smi` reports memory as "Not Supported", so the per-process query always showed 0 |
+| `start.sh`, `scripts/prepare.sh`, `scripts/config.sh` | Thor in messages and comments (sm_110 kernel compile, Thor budget) | accuracy |
+| `tools/thor-decode.py` | new: the vLLM Thor fork's decode workload plus a concurrency sweep | head-to-head measurement |
+| `README.md` | this section | documentation |
+
+## Measured on Thor
+
+These results come from one start with the defaults. The server was idle between runs.
+
+**Decode, head to head with the vLLM Thor fork.** Both used the same workload: the prompts from its
+`bench/thor-decode.py`, temperature 0, thinking off, 400 tokens, and the median of 3. Figures are end-to-end,
+including prefill and HTTP.
 
 | Workload | TensorFold (this fork) | vLLM Thor fork (2026-09-26) | Change |
 | --- | ---: | ---: | ---: |
-| Prose, 1 stream, greedy, thinking off, 400 tok (median of 3, end-to-end) | **46.0 tok/s** | 36.3-36.7 tok/s | **+26%** |
-| Code, same method | **67.3 tok/s** | 59.0-59.5 tok/s | **+14%** |
-| Streams (prose, sampled, 400 tok) | 1: 41.9 · 2: 61.2 · 5: **78.3** tok/s aggregate | 1 stream only | 5 x 262k KV pool |
+| Prose | **46.0 tok/s** (219 of 378 drafts accepted) | 36.3-36.7 tok/s | **+26%** |
+| Code | **67.3 tok/s** (303 of 416 drafts accepted) | 59.0-59.5 tok/s | **+14%** |
 
-| Prefill (`tools/bench.py`) | 850 | 3,217 | 12,644 | 50,325 | 194,893 (`tools/needle.py`) |
+**Concurrent requests.** Prose, sampled with seeds, thinking off, 400 tokens. The vLLM fork serves one stream.
+
+| Streams | Aggregate | Per stream | Spark (upstream, 4-5 streams) |
+| ---: | ---: | ---: | ---: |
+| 1 | 41.9 tok/s | 41.9 tok/s | 62.4 |
+| 2 | 61.2 tok/s | 30.6 tok/s | 90.5 |
+| 5 | **78.3 tok/s** | 15.9 tok/s | 119.3 |
+
+**Prefill** (`tools/bench.py thor`, `tools/needle.py`, with the default 2,048-row chunks):
+
+| Prompt tokens | 850 | 3,217 | 12,644 | 50,325 | 194,893 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Thor | 929 tok/s | 1,065 tok/s | 1,119 tok/s | 945 tok/s | 867 tok/s (225 s, CORRECT) |
-| Spark (upstream) | | ~2,400 tok/s | ~2,500 tok/s | ~2,400 tok/s | ~2,000 tok/s (97 s) |
+| Thor | 929 tok/s | 1,065 tok/s | 1,119 tok/s | 945 tok/s | 867 tok/s (225 s) |
+| Spark (upstream) | | ~2,400 tok/s | ~2,500 tok/s | ~2,400 tok/s | ~2,000 tok/s (~97-102 s) |
 
-Single-stream decode is memory-bandwidth bound, and Thor and GB10 have the same 273 GB/s: Thor gets ~74% of the
-Spark's 62.4 tok/s. Prefill and many-stream decode are compute bound, and Thor has 20 SMs against GB10's 48: ~45%
-of the Spark's prefill, and 78 instead of 119 tok/s at 5 streams. `tools/toolcheck.py` and `tools/visioncheck.py`
-pass. The lowest free memory during the 195k-token prompt was 12 GiB. Weights load in ~126 s.
+`tools/bench.py` also reported decode at 46.8 tok/s (code, greedy) and 49.3 tok/s (chat, sampled), each the median
+of 5.
 
-Thor notes: run nothing else large alongside it (the vLLM fork and llama.cpp servers use the same memory and, for
-vLLM, port 8888); keep MAXN and `sudo jetson_clocks` for the numbers above.
+**Checks.** All passed:
+
+- `tools/needle.py` returned the passphrase from a 194,893-token prompt (CORRECT).
+- `tools/toolcheck.py` returned the array parameter as a JSON array.
+- `tools/visioncheck.py` named both the red circle and the blue square.
+- The smoke test ran at start.
+- The lowest `MemAvailable` during the 195k-token prompt was 12 GiB (the Spark's lowest was 8.3 GiB).
+- The weights loaded in 126 s. The startup estimate was 102.50 GiB within a budget of 105.58 GiB.
+
+**Reading the numbers.** Single-stream decode is limited by memory bandwidth. Thor and GB10 both have 273 GB/s
+LPDDR5X, so Thor reaches ~74% of the Spark's single-stream speed. The gap comes from the lower GPU clock and from
+compute in the MTP verify pass.
+
+Prefill and many-stream decode are limited by compute. Thor has 20 SMs at 1.575 GHz against GB10's 48. That gives
+~45% of the Spark's prefill and ~65% of its 5-stream aggregate.
+
+**Summary.** The Spark's gains carry over fully for single-request chat and code: this fork is faster than the
+vLLM fork and serves 5 full-context streams where that fork serves 1. Long prompts take about 2.3x longer than on
+a Spark. vLLM Thor prefill has not been measured, so there is no head-to-head prefill comparison.
+
+## Reproducing the measurements
+
+```bash
+./start.sh                       # server on :8888, defaults
+python3 tools/thor-decode.py     # decode head to head + 1/2/5 streams
+python3 tools/bench.py thor      # prefill 0.85k-50k + short decode
+python3 tools/needle.py          # 195k-token needle (~4 min on Thor)
+python3 tools/toolcheck.py; python3 tools/visioncheck.py
+```
+
+For the vLLM side, stop this server and run `./start-thor.sh` and `bench/thor-decode.py` in the vLLM Thor fork.
+
+## Thor notes and troubleshooting
+
+- **One large model at a time.** This server holds ~110 GiB of the shared memory, and the vLLM Thor fork also uses
+  port 8888. Run `./stop.sh` before starting vLLM or a llama.cpp server, and stop those before `./start.sh`.
+  `start.sh` warns when less than 115 GiB is available.
+- **The "CUDA Minor Version Compatibility mode ENABLED" warning** (`CUDA_ERROR_SYSTEM_DRIVER_MISMATCH ... cuInit()=803`)
+  at every start is expected, because the container's CUDA 13.3 is newer than the Thor driver's 13.0. It is
+  harmless; it would matter only if a kernel needed driver-side PTX JIT for features newer than 13.0.
+- **`--gpus` errors** ("use the NVIDIA Container Runtime"): keep `GPU_ARGS` at its default. The nvidia runtime must
+  be listed in `docker info | grep -i runtime`.
+- **First start after an image change** compiles the CUDA extensions (about 3 minutes on Thor). Later starts reuse
+  `~/.cache/tensorfold-qwen38`.
+- **Clocks.** The numbers above were measured in MAXN with the GPU at its 1,575 MHz maximum. Check the clock with
+  `cat /sys/class/devfreq/gpu-gpc-0/cur_freq`. Lower power modes reduce throughput, prefill most of all.
+- **Faster prefill** (text only): `VISION=0 ./start.sh restart` uses 4,096-row chunks. That is 2-5% faster on a
+  Spark; it has not been measured on Thor.
 
 ---
 

@@ -28,6 +28,9 @@ BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 DRAFT_LANGUAGE="${DRAFT_LANGUAGE:-}"
 IMAGE="${IMAGE:-tensorfold-qwen38:${TF_VERSION}${DRAFT_LANGUAGE:+-languages}}"   # the local image prepare.sh builds or pulls
 CONTAINER_NAME="${CONTAINER_NAME:-qwen38-flash-next-tf}"          # the server's container
+# How containers get the GPU. Jetson AGX Thor (JetPack 7) rejects the bare `--gpus` hook ("use the NVIDIA Container
+# Runtime"), so the nvidia runtime is named explicitly; a DGX Spark accepts this too.
+GPU_ARGS="${GPU_ARGS:---runtime nvidia --gpus all}"
 # The prebuilt images: prepare.sh pulls $GHCR_IMAGE:<TF_VERSION>-<patches hash>; publish-image.sh pushes it (and
 # :latest, or :languages for the DRAFT_LANGUAGE image).
 GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/qwen3.8-flash-next-single-dgx-spark-tensorfold}"
@@ -36,7 +39,7 @@ SERVED_NAME="${SERVED_NAME:-Qwen3.8-Flash-Next}"   # the model id clients see in
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8888}"
 # Serving defaults (./start.sh arguments come after them and win). All streams share one memory pool (~103-104 GiB
-# budget on a 128 GB Spark, 75 GiB of it weights), so window x streams x KV bytes must fit: 4 streams x 262,144 tokens
+# budget on a 128 GB Spark, ~105.8 GiB on an idle AGX Thor; 75 GiB of it weights), so window x streams x KV bytes must fit: 4 streams x 262,144 tokens
 # at int8 KV is ~97.8 GiB, 5 streams ~102.6 GiB (~4.5 GiB a stream). Other fits: 3 streams bf16 at 262k, 6 streams
 # int4 at 262k, 8 streams int4 at ~250k (tight), 6 streams int8 at ~220k. int4 and bf16 KV change the output slightly.
 PARALLEL="${PARALLEL:-5}"          # requests decoded together (streams)

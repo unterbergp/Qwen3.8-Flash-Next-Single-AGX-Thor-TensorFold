@@ -1,3 +1,52 @@
+<h1 align="center">Qwen3.8 Flash Next on one Jetson AGX Thor (TensorFold)</h1>
+
+> **This fork runs on NVIDIA Jetson AGX Thor.** It is MiaAI Lab's DGX Spark TensorFold recipe with the few changes
+> Thor needs; the rest of this README is the upstream Spark text, and its numbers are Spark numbers unless marked Thor.
+> For the Spark version use [MiaAI Lab's repository](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold).
+
+## AGX Thor
+
+Tested 2026-09-30 on AGX Thor (sm_110, 20 SMs, 122 GiB shared RAM), Jetson Linux R38.2.2, driver 580.00 / CUDA 13.0,
+MAXN power mode, GPU at 1,575 MHz. Same image as the Spark (`ghcr.io/miaai-lab/...:v0.3.6.3-c1f5d72f8d16`), same
+defaults: 5 streams x 262,144 tokens, int8 KV, n-gram tables on SSD, vision on. `./start.sh` works unchanged.
+
+**Why it works:** TensorFold JIT-compiles its CUDA extensions for the GPU present (`-gencode ... sm_110`), and its
+kernels use only sm_90-level features (FP8 `mma.sync`, thread-block clusters, `cp.async`) plus Triton, all of which
+Thor supports. Memory is detected as unified (`is_integrated`), so the budget comes from `MemAvailable`: 105.6 GiB on
+an idle Thor against the default's 102.5 GiB estimate. The container's CUDA 13.3 runs on the 13.0 driver in minor
+version compatibility mode (the warning at start is expected); the kernels are native sm_110 code, so no driver JIT
+is needed.
+
+**What changed for Thor:**
+
+- `docker run` uses `--runtime nvidia --gpus all` (`GPU_ARGS` in `scripts/config.sh`): JetPack 7 rejects bare
+  `--gpus all` ("use the NVIDIA Container Runtime").
+- The loading heartbeat reads the drop in `MemAvailable`: Thor's `nvidia-smi` reports no per-process memory.
+- Text: Thor instead of Spark/GB10 in the scripts' messages.
+
+**Measured on Thor** (one start, server idle between runs):
+
+| Workload | TensorFold (this fork) | vLLM Thor fork (2026-09-26) | Change |
+| --- | ---: | ---: | ---: |
+| Prose, 1 stream, greedy, thinking off, 400 tok (median of 3, end-to-end) | **46.0 tok/s** | 36.3-36.7 tok/s | **+26%** |
+| Code, same method | **67.3 tok/s** | 59.0-59.5 tok/s | **+14%** |
+| Streams (prose, sampled, 400 tok) | 1: 41.9 · 2: 61.2 · 5: **78.3** tok/s aggregate | 1 stream only | 5 x 262k KV pool |
+
+| Prefill (`tools/bench.py`) | 850 | 3,217 | 12,644 | 50,325 | 194,893 (`tools/needle.py`) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Thor | 929 tok/s | 1,065 tok/s | 1,119 tok/s | 945 tok/s | 867 tok/s (225 s, CORRECT) |
+| Spark (upstream) | | ~2,400 tok/s | ~2,500 tok/s | ~2,400 tok/s | ~2,000 tok/s (97 s) |
+
+Single-stream decode is memory-bandwidth bound, and Thor and GB10 have the same 273 GB/s: Thor gets ~74% of the
+Spark's 62.4 tok/s. Prefill and many-stream decode are compute bound, and Thor has 20 SMs against GB10's 48: ~45%
+of the Spark's prefill, and 78 instead of 119 tok/s at 5 streams. `tools/toolcheck.py` and `tools/visioncheck.py`
+pass. The lowest free memory during the 195k-token prompt was 12 GiB. Weights load in ~126 s.
+
+Thor notes: run nothing else large alongside it (the vLLM fork and llama.cpp servers use the same memory and, for
+vLLM, port 8888); keep MAXN and `sudo jetson_clocks` for the numbers above.
+
+---
+
 <h1 align="center">Qwen3.8 Flash Next on one DGX Spark (TensorFold)</h1>
 
 <p align="center">

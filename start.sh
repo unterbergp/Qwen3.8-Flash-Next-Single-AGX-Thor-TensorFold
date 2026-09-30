@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Serve Qwen3.8 Flash Next (Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP) with TensorFold on one DGX Spark, end to end:
+# Serve Qwen3.8 Flash Next (Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP) with TensorFold on one Jetson AGX Thor, end to end:
 # runs scripts/prepare.sh when the image or the checkpoint is not ready yet (first run, or after patches change),
 # launches `tensorfold serve` on port 8888, waits until the OpenAI API answers, then runs a smoke test.
 # Stop it with ./stop.sh.
@@ -134,12 +134,13 @@ ENV_ARGS=()
 while IFS='=' read -r name _; do ENV_ARGS+=(-e "$name"); done < <(env | grep -E '^TENSORFOLD_[A-Z0-9_]+=' || true)
 
 # ---------------------------------------------------------------- 3. launch
+avail0_kib=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)   # before launch, for the loading heartbeat
 step 3 "Launch: container $CONTAINER_NAME"
 log "tensorfold serve $MODEL_ID --host $HOST --port $PORT ${SERVE_ARGS[*]}"
 # No token goes into the container: serving reads only the local cache (HF_HUB_OFFLINE=1), and with
 # HF_HUB_OFFLINE=0 huggingface_hub finds the token file in the mounted cache.
 docker run -d --name "$CONTAINER_NAME" \
-  --gpus all --ipc=host --network host \
+  $GPU_ARGS --ipc=host --network host \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   -e HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" "${ENV_ARGS[@]}" \
   -v "$HF_CACHE":/root/.cache/huggingface \
@@ -162,13 +163,10 @@ docker logs -f "$CONTAINER_NAME" > >(grep --line-buffered -v -E "$NOISE" | sed -
 LOGS_PID=$!
 trap 'kill $LOGS_PID 2>/dev/null || true' EXIT
 
-# GPU memory the container's processes hold so far, against the server's own startup estimate (GiB)
+# Memory the server holds so far, against its own startup estimate (GiB). Thor's nvidia-smi reports no per-process
+# memory ("Not Supported"), and GPU and host share one pool, so this is the drop in MemAvailable since the launch.
 loaded_gib() {
-  local pids
-  pids=$(docker top "$CONTAINER_NAME" -eo pid 2>/dev/null | tail -n +2 | paste -sd'|')
-  [[ -n "$pids" ]] || { echo 0; return; }
-  nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null |
-    awk -F', *' -v re="^($pids)$" '$1 ~ re { s += $2 } END { printf "%.1f", s / 1024 }'
+  awk -v a0="$avail0_kib" '/^MemAvailable:/ { d = (a0 - $2) / 1048576; printf "%.1f", d < 0 ? 0 : d }' /proc/meminfo
 }
 fail() {
   kill $LOGS_PID 2>/dev/null || true
@@ -185,7 +183,7 @@ until curl -sf --max-time 5 "$URL/v1/models" >/dev/null 2>&1; do
   (( SECONDS - start < WAIT_TIMEOUT )) || fail "not ready after ${WAIT_TIMEOUT}s (WAIT_TIMEOUT); it is still running: docker logs -f $CONTAINER_NAME"
   if (( SECONDS - start >= next_beat )); then
     estimate=$(docker logs "$CONTAINER_NAME" 2>&1 | sed -n 's/.*startup estimate \([0-9.]*\) GiB.*/\1/p' | tail -1)
-    printf '  %s⋯ %ss elapsed, %s%s GiB on the GPU%s\n' "$D" "$((SECONDS - start))" "$(loaded_gib)" "${estimate:+ of ~$estimate}" "$R"
+    printf '  %s⋯ %ss elapsed, %s%s GiB loaded%s\n' "$D" "$((SECONDS - start))" "$(loaded_gib)" "${estimate:+ of ~$estimate}" "$R"
     next_beat=$((next_beat + 15))
   fi
   sleep 3
@@ -209,7 +207,7 @@ IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] || IP="$HOST"
 printf '\n%s  ✔ %s is now LIVE! on port %s%s\n\n' "$G" "$SERVED" "$PORT" "$R"
 cat <<EOF
-    API      http://${IP:-<spark-address>}:$PORT/v1   (model: $SERVED)
+    API      http://${IP:-<thor-address>}:$PORT/v1   (model: $SERVED)
     Logs     docker logs -f $CONTAINER_NAME
     Restart  ./start.sh restart
     Stop     ./stop.sh

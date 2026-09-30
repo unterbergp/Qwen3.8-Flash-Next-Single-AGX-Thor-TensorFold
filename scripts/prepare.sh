@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Prepare everything needed to serve Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP with TensorFold on one DGX Spark:
+# Prepare everything needed to serve Vontra/Qwen3.8-Flash-Next-MLX-4bit-MTP with TensorFold on one Jetson AGX Thor:
 #   1. preflight checks (docker, GPU runtime, disk space)
 #   2. the image: TensorFold plus patches/*.patch (and patches/languages/*.patch with DRAFT_LANGUAGE) on NVIDIA's
 #      PyTorch container, pulled prebuilt from $GHCR_IMAGE when a matching tag is reachable (PULL=0 skips that), else
@@ -31,7 +31,7 @@ command -v docker >/dev/null || die "docker is not installed"
 docker info >/dev/null 2>&1 || die "cannot talk to the docker daemon (is your user in the docker group?)"
 if ! command -v nvidia-smi >/dev/null; then warn "nvidia-smi not found on the host"
 elif ! nvidia-smi -L; then warn "nvidia-smi failed: is the NVIDIA driver working?"; fi
-docker info 2>/dev/null | grep -qi nvidia || warn "docker does not list an nvidia runtime; --gpus all may fail"
+docker info 2>/dev/null | grep -qi nvidia || warn "docker does not list an nvidia runtime; $GPU_ARGS will fail (install nvidia-container-toolkit)"
 
 mkdir -p "$HF_CACHE/hub" "$KERNEL_CACHE/torch_extensions" "$KERNEL_CACHE/triton"
 
@@ -143,4 +143,4 @@ tf_run info "$MODEL_ID"
 
 prepared_state > "$PREPARED_MARKER"
 log "Done. Start the server with ./start.sh (port $PORT)."
-log "The first start compiles CUDA kernels for GB10 (a few minutes); they are cached in $KERNEL_CACHE."
+log "The first start compiles CUDA kernels for this GPU (Thor: sm_110, ~3 min); they are cached in $KERNEL_CACHE."

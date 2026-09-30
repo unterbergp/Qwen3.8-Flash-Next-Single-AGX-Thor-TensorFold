@@ -90,6 +90,11 @@ HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"
 # Persists compiled CUDA kernels (torch extensions + triton) so only the first start pays the compile.
 KERNEL_CACHE="${KERNEL_CACHE:-$HOME/.cache/tensorfold-qwen38}"
 
+# Run as root (passwordless sudo) by start.sh before it measures free memory and by stop.sh after the container is
+# gone: the default drops the page cache, which on unified memory is memory the GPU could have. Point it at your own
+# script in .env, or set it empty to skip it.
+CLEAN_SCRIPT="${CLEAN_SCRIPT-scripts/clean-memory.sh}"
+
 MIN_FREE_GB="${MIN_FREE_GB:-125}"   # free disk the checkpoint download needs (it is ~114 GB)
 IMAGE_FREE_GB="${IMAGE_FREE_GB:-35}"   # free disk under Docker's root that pulling or building the image needs
 
@@ -120,4 +125,16 @@ prepared_state() {
   label=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || echo missing)
   ls -d "$(model_cache_dir)"/snapshots/*/ >/dev/null 2>&1 && model=present
   echo "model=$MODEL_ID($model) image=$IMAGE($label) patches=$hash"
+}
+
+# Free cached memory with $CLEAN_SCRIPT (see above); a missing script or a failure only warns.
+clean_memory() {
+  [[ -n "$CLEAN_SCRIPT" ]] || return 0
+  [[ -f "$CLEAN_SCRIPT" ]] || { warn "CLEAN_SCRIPT $CLEAN_SCRIPT not found: memory not cleaned"; return 0; }
+  local before; before=$(free -g | awk '/^Mem:/ {print $7}')
+  if sudo -n bash "$CLEAN_SCRIPT" >/dev/null; then
+    log "Cleaned memory with $CLEAN_SCRIPT: ${before} -> $(free -g | awk '/^Mem:/ {print $7}') GiB available"
+  else
+    warn "$CLEAN_SCRIPT failed (it needs passwordless sudo; CLEAN_SCRIPT= skips it): memory not cleaned"
+  fi
 }

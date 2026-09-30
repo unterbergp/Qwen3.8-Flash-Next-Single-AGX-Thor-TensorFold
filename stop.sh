@@ -9,6 +9,7 @@ source ./scripts/config.sh
 
 if ! docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
   log "No container named $CONTAINER_NAME: nothing to stop"
+  clean_memory
   exit 0
 fi
 if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME")" == true ]]; then
@@ -22,3 +23,4 @@ if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME")" == true ]]; 
 fi
 docker rm -f "$CONTAINER_NAME" >/dev/null
 log "Stopped and removed $CONTAINER_NAME; its GPU memory is free again"
+clean_memory

@@ -447,6 +447,7 @@ wins over it), or with `tensorfold serve` flags (`./start.sh --context 131072`).
 | `THINKING` | `1` | open a think block by default; `0` answers directly unless a request asks to think |
 | `SERVED_NAME` | `Qwen3.8-Flash-Next` | the model id in `/v1/models` and in replies |
 | `PORT` / `HOST` | `8888` / `0.0.0.0` | where the API listens |
+| `CLEAN_SCRIPT` | `scripts/clean-memory.sh` | run with passwordless `sudo` before each start and after each stop to drop the page cache, which on Thor's unified memory the GPU needs; your own script, or empty to skip |
 | `TENSORFOLD_PREFILL_ROWS` | `2048` (`4096` with `VISION=0`) | rows per prompt chunk (patch 0006); 4,096 is 2-5% faster from 3k tokens and takes 0.94 GiB more |
 | `TENSORFOLD_MTP_COPY` | `1` | prompt-lookup drafts for text that repeats the prompt (patch 0007; needs `PARALLEL` >= 2); `0` turns them off |
 | `TENSORFOLD_MAX_IMAGES` / `TENSORFOLD_IMAGE_TOKENS` | `50` / `16384` | images a request may carry and the tokens they share, each at most 4,096 (patch 0009) |

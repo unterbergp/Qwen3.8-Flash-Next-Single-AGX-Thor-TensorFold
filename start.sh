@@ -120,6 +120,7 @@ fi
 if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
   die "port $PORT is already in use: $(ss -ltnp "sport = :$PORT" 2>/dev/null | tail -n +2)"
 fi
+clean_memory                                          # before measuring: cached memory is the GPU's too
 # TensorFold budgets the free memory minus a tenth of RAM; the default 5 x 262k int8 needs ~102.6 GiB of that
 # (75 GiB of it weights), i.e. ~115 GiB free at start. With less it refuses the window and names one that fits.
 avail_gb=$(free -g | awk '/^Mem:/ {print $7}')
